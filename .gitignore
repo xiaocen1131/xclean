@@ -1,0 +1,12 @@
+# 本地凭据与运行数据，绝不提交
+.xclean/
+token.json
+state.json
+audit.jsonl
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
