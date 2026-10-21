@@ -48,6 +48,11 @@ BACKUP_DIR = HOME / "backups"
 
 USER_AGENT = "xclean/1.0 (+official-api)"
 
+# 官方单价（docs.x.com/x-api/getting-started/pricing，2026-10 核对）
+PRICE_OWNED_READ = 0.001      # 读自己的帖子，Owned Reads
+PRICE_CONTENT_MANAGE = 0.005  # 删除帖子的计费类别 Content: Manage
+# 同一资源 24 小时内重复读取不重复计费，所以一次完整清理的读取成本按条数计一次。
+
 # 删除端点限速：50 次 / 15 分钟。留一点余量，不贴着上限跑。
 DELETE_WINDOW_SECONDS = 15 * 60
 DELETE_WINDOW_BUDGET = 50
@@ -624,6 +629,13 @@ class Plan:
         dates = [c.created_at for c in self.candidates if c.created_at]
         return min(dates) if dates else "—"
 
+    def estimate(self, *, skip_reads: bool = False) -> tuple[float, float]:
+        """返回 (读取成本, 删除成本)。归档模式跳过读取计费。"""
+        n = len(self.candidates)
+        read_cost = 0.0 if skip_reads else n * PRICE_OWNED_READ
+        delete_cost = n * PRICE_CONTENT_MANAGE
+        return read_cost, delete_cost
+
 
 KIND_LABEL = {
     "original": "原创",
@@ -633,7 +645,72 @@ KIND_LABEL = {
 }
 
 
+def load_archive_plan(args: argparse.Namespace) -> Plan:
+    """从本地清单构建计划：只调一次 users/me 确认身份，不读时间线。"""
+    token = access_token()
+    me = fetch_me(token)
+
+    if args.account and args.account.lstrip("@").lower() != str(me.get("username", "")).lower():
+        raise XCleanError(
+            f"登录账号是 @{me.get('username')}，与指定的 @{args.account.lstrip('@')} 不一致，已停止。"
+        )
+
+    path = Path(args.from_archive)
+    if not path.exists():
+        raise XCleanError(f"清单文件不存在：{path}")
+
+    plan = Plan(account=str(me.get("username")), user_id=str(me["id"]))
+    bad = 0
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                bad += 1
+                continue
+            kind = row.get("kind", "original")
+            if kind not in KIND_LABEL:
+                bad += 1
+                continue
+            if kind == "reply" and (args.exclude_replies or not args.include_replies):
+                continue
+            if kind == "repost" and (args.exclude_retweets or not args.include_retweets):
+                continue
+            if args.kind and kind not in args.kind:
+                continue
+            cand = Candidate(
+                id=str(row.get("id", "")),
+                kind=kind,
+                text=str(row.get("text", "")),
+                created_at=str(row.get("created_at", "")),
+                source_id=row.get("source_id"),
+            )
+            if not cand.id:
+                bad += 1
+                continue
+            if args.contains and args.contains.lower() not in cand.text.lower():
+                continue
+            if args.before and cand.created_at and cand.created_at > args.before:
+                continue
+            if args.after and cand.created_at and cand.created_at < args.after:
+                continue
+            plan.candidates.append(cand)
+            if args.limit and len(plan.candidates) >= args.limit:
+                break
+
+    if bad:
+        print(f"跳过 {bad} 行无法识别的记录")
+    print(f"从清单载入：{len(plan.candidates)} 条（未调用时间线接口，无读取费用）")
+    return plan
+
+
 def build_plan(args: argparse.Namespace) -> Plan:
+    if getattr(args, "from_archive", None):
+        return load_archive_plan(args)
+
     token = access_token()
     me = fetch_me(token)
 
@@ -678,8 +755,12 @@ def build_plan(args: argparse.Namespace) -> Plan:
     return plan
 
 
-def print_plan(plan: Plan) -> None:
+def print_plan(plan: Plan, *, skip_reads: bool = False) -> None:
     counts = plan.counts()
+    read_cost, delete_cost = plan.estimate(skip_reads=skip_reads)
+    per_hour = DELETE_WINDOW_BUDGET * (3600 / DELETE_WINDOW_SECONDS)
+    hours = len(plan.candidates) / per_hour
+
     print()
     print("─" * 52)
     print(f"  账号    @{plan.account}")
@@ -689,7 +770,15 @@ def print_plan(plan: Plan) -> None:
         print(f"  构成    {detail}")
     print(f"  最早    {plan.earliest()}")
     print("─" * 52)
-    print("  删除不可恢复。X API 按用量计费，删除请求同样计入。")
+    if skip_reads:
+        print("  读取    用本地归档，不计费")
+    else:
+        print(f"  读取    ${read_cost:.3f}（$0.001/条，同日重复读取不重复计费）")
+    print(f"  删除    ${delete_cost:.3f}（$0.005/条）")
+    print(f"  合计    ${read_cost + delete_cost:.3f}")
+    print(f"  耗时    约 {hours:.1f} 小时（限速 50 次/15 分钟）")
+    print("─" * 52)
+    print("  删除不可恢复。X 已取消 API 免费档，删除请求无法归零。")
     print("─" * 52)
     print()
 
@@ -705,8 +794,9 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_delete(args: argparse.Namespace) -> int:
+    skip_reads = bool(getattr(args, "from_archive", None))
     plan = build_plan(args)
-    print_plan(plan)
+    print_plan(plan, skip_reads=skip_reads)
 
     if not plan.candidates:
         print("没有符合条件的内容，未执行任何删除。")
@@ -722,6 +812,17 @@ def cmd_delete(args: argparse.Namespace) -> int:
     if not pending:
         print("没有剩余待删内容。")
         return 0
+
+    # 预算护栏：按删除单价估算，超了直接停，不发请求。
+    if args.budget is not None:
+        projected = len(pending) * PRICE_CONTENT_MANAGE
+        print(f"本次预计花费 ${projected:.3f}，预算上限 ${args.budget:.3f}")
+        if projected > args.budget:
+            allowed = int(args.budget // PRICE_CONTENT_MANAGE)
+            raise XCleanError(
+                f"预计 ${projected:.3f} 超过预算 ${args.budget:.3f}。"
+                f"按预算最多能删 {allowed} 条，可加 --limit {allowed}，或调高 --budget。"
+            )
 
     path = backup(plan.candidates, plan.account)
 
@@ -846,6 +947,17 @@ def add_filter_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--include-retweets", action="store_true", help="包含转推")
     parser.add_argument("--exclude-replies", action="store_true", help="排除回复")
     parser.add_argument("--exclude-retweets", action="store_true", help="排除转推")
+    parser.add_argument(
+        "--from-archive",
+        metavar="FILE",
+        help="用 archive_import.py 生成的清单删除，跳过读取计费（最省钱）",
+    )
+    parser.add_argument(
+        "--budget",
+        type=float,
+        metavar="USD",
+        help="本次最多花多少美元，超出即停止（按 $0.005/条估算）",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
